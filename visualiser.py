@@ -1,4 +1,5 @@
 import csv
+import itertools
 import logging
 import multiprocessing as mp
 import os
@@ -591,10 +592,60 @@ class LTSpiceOptimizer:
     def _calculate_area_penalty(self, params: Dict[str, float]) -> float:
         return 0
 
+    def _grid_search(self, n_points: int = 10) -> None:
+        """Perform grid search over parameter space and log results"""
+        # Create grid points for each parameter
+        param_grids = {}
+        for param_name, base_value in self.params.items():
+            # Create grid from 0.5x to 1.5x of base value
+            param_grids[param_name] = np.linspace(
+                base_value * 0.5, base_value * 1.5, n_points
+            )
+
+        # Create working directory
+        working_dir = Path(self.net_file.parent) / "grid_search_temp"
+        working_dir.mkdir(exist_ok=True)
+
+        # Create CSV file for grid search results
+        grid_csv = "grid_search_results.csv"
+        with open(grid_csv, "w", newline="") as f:
+            fieldnames = ["point_type"] + list(self.params.keys()) + ["objective_value"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+        try:
+            # Evaluate points in grid
+            for i, param_values in enumerate(itertools.product(*param_grids.values())):
+                params = dict(zip(self.params.keys(), param_values))
+
+                # Create and simulate netlist
+                net_file = working_dir / f"grid_point_{i}.net"
+                self._create_modified_net(params, net_file)
+                result = self._run_simulation(net_file)
+
+                # Calculate objective
+                objective = result.objective_function(
+                    self.weights, params, self.regularization_weight
+                )
+
+                # Log result
+                row_data = {"point_type": "grid"}
+                row_data.update(params)
+                row_data["objective_value"] = objective
+
+                with open(grid_csv, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writerow(row_data)
+
+        finally:
+            import shutil
+
+            shutil.rmtree(working_dir)
+
     def optimize_single(
         self, initial_params: Dict[str, float], start_id: int = 0
     ) -> OptimizationResult:
-        """Run single optimization with given initial parameters"""
+        """Run single optimization with given initial parameters and track path"""
         # Create working directory and copy original netlist
         working_dir = Path(self.net_file.parent) / f"optimization_temp_{os.getpid()}"
         working_dir.mkdir(exist_ok=True)
@@ -624,66 +675,86 @@ class LTSpiceOptimizer:
             no_improvement_count = 0
             last_best_objective = float("-inf")
 
-            for iteration in range(self.max_iterations):
-                try:
-                    current_net = working_dir / f"iter_{iteration}.net"
-                    self._create_modified_net(current_params, current_net)
-                    result = self._run_simulation(current_net)
+            # Log optimization path
+            with open("grid_search_results.csv", "a", newline="") as f:
+                fieldnames = (
+                    ["point_type"] + list(self.params.keys()) + ["objective_value"]
+                )
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
 
-                    # Calculate objective with regularization
-                    objective_value = result.objective_function(
-                        self.weights, current_params, self.regularization_weight
-                    )
+                for iteration in range(self.max_iterations):
+                    try:
+                        current_net = working_dir / f"iter_{iteration}.net"
+                        self._create_modified_net(current_params, current_net)
+                        result = self._run_simulation(current_net)
 
-                    # Remove separate regularization calculation since it's now part of objective
-                    area_penalty = self._calculate_area_penalty(current_params)
-                    objective_value -= area_penalty
+                        # Calculate objective with regularization
+                        objective_value = result.objective_function(
+                            self.weights, current_params, self.regularization_weight
+                        )
 
-                    # Update best parameters if improved
-                    if objective_value > best_objective:
-                        best_objective = objective_value
-                        best_params = current_params.copy()
-                        best_result = result
-                        no_improvement_count = 0
-                        last_best_objective = objective_value
-                    else:
-                        no_improvement_count += 1
-                    # Early stopping for single optimization
-                    if (
-                        no_improvement_count >= 5
-                    ):  # Stop after 5 iterations without improvement
-                        self.logger.info(
-                            f"Stopping optimization at iteration {iteration + 1} due to no improvement"
+                        # Remove separate regularization calculation since it's now part of objective
+                        area_penalty = self._calculate_area_penalty(current_params)
+                        objective_value -= area_penalty
+
+                        # Update best parameters if improved
+                        if objective_value > best_objective:
+                            best_objective = objective_value
+                            best_params = current_params.copy()
+                            best_result = result
+                            no_improvement_count = 0
+                            last_best_objective = objective_value
+                        else:
+                            no_improvement_count += 1
+                        # Early stopping for single optimization
+                        if (
+                            no_improvement_count >= 5
+                        ):  # Stop after 5 iterations without improvement
+                            self.logger.info(
+                                f"Stopping optimization at iteration {iteration + 1} due to no improvement"
+                            )
+                            break
+                        # Reduce logging - only log every 5 iterations or on improvement
+                        if iteration % 5 == 0 or objective_value > last_best_objective:
+                            self.logger.info(
+                                f"Iteration {iteration + 1}: "
+                                f"Objective: {objective_value:.2e}, "
+                                f"Learning Rate: {self.learning_rate:.2e}"
+                            )
+                        self._log_to_csv(
+                            iteration + 1,
+                            current_params,
+                            result,
+                            objective_value,
+                            start_id,
                         )
-                        break
-                    # Reduce logging - only log every 5 iterations or on improvement
-                    if iteration % 5 == 0 or objective_value > last_best_objective:
-                        self.logger.info(
-                            f"Iteration {iteration + 1}: "
-                            f"Objective: {objective_value:.2e}, "
-                            f"Learning Rate: {self.learning_rate:.2e}"
+                        # Adaptive learning rate
+                        self._adaptive_learning_rate(
+                            iteration, prev_objective, objective_value
                         )
-                    self._log_to_csv(
-                        iteration + 1, current_params, result, objective_value, start_id
-                    )
-                    # Adaptive learning rate
-                    self._adaptive_learning_rate(
-                        iteration, prev_objective, objective_value
-                    )
-                    prev_objective = objective_value
-                    gradient = self._compute_gradient(
-                        current_params, working_dir, objective_value
-                    )
-                    # Update parameters
-                    for param_name, grad_value in gradient.items():
-                        current_params[param_name] += self.learning_rate * grad_value
-                except Exception as e:
-                    self.logger.error(f"Error in iteration {iteration}: {str(e)}")
-                    if best_result is not None:
-                        return OptimizationResult(
-                            best_params, best_objective, best_result
+                        prev_objective = objective_value
+                        gradient = self._compute_gradient(
+                            current_params, working_dir, objective_value
                         )
-                    raise
+                        # Update parameters
+                        for param_name, grad_value in gradient.items():
+                            current_params[param_name] += (
+                                self.learning_rate * grad_value
+                            )
+
+                        # Log the point in optimization path
+                        row_data = {"point_type": f"path_{start_id}"}
+                        row_data.update(current_params)
+                        row_data["objective_value"] = objective_value
+                        writer.writerow(row_data)
+
+                    except Exception as e:
+                        self.logger.error(f"Error in iteration {iteration}: {str(e)}")
+                        if best_result is not None:
+                            return OptimizationResult(
+                                best_params, best_objective, best_result
+                            )
+                        raise
 
         finally:
             # Restore original netlist path
@@ -714,70 +785,16 @@ if __name__ == "__main__":
             "pdp": 1.0e16,
         },
         regularization_weight=2,
-        csv_log_file="optimization_results_base.csv",
+        csv_log_file="optimization_results_vis.csv",
     )
 
+    # Perform grid search first
+    optimizer._grid_search(n_points=10)
+
+    # Then run optimization
     try:
         result = optimizer.optimize_multi(n_starts=8)
         print("\nOptimization complete!")
-        print(f"Best objective value: {result.objective:.2e}")
-        print("Best parameters:", result.params)
-        print("\nFinal metrics:")
-        print(f"Average power: {result.metrics.avg_power:.2e}")
-        print(f"Rise time: {result.metrics.t_rise_50:.2e}")
-        print(f"Delay: {result.metrics.delay_ps:.2e}")
-        print(f"PDP: {result.metrics.pdp:.2e}")
-    except Exception as e:
-        print(f"Optimization failed: {str(e)}")
-
-    optimizer = LTSpiceOptimizer(
-        net_file="~/.wine/drive_c/my_ltspice_files/StrongArmLatch.net",
-        ltspice_path="~/.wine/drive_c/Program Files/LTC/LTspiceXVII/XVIIx64.exe",
-        epsilon=5,
-        initial_learning_rate=0.02,
-        max_iterations=15,
-        weights={
-            "avg_power": 1.0e5,
-            "t_rise_50": 0.0e11,
-            "delay_ps": 0.0e11,
-            "pdp": 0.5e16,
-        },
-        regularization_weight=2,
-        csv_log_file="optimization_results_no_t.csv",
-    )
-
-    try:
-        result = optimizer.optimize_multi(n_starts=8)
-        print("\nOptimization complete! NO T RISE PRECEDENCE")
-        print(f"Best objective value: {result.objective:.2e}")
-        print("Best parameters:", result.params)
-        print("\nFinal metrics:")
-        print(f"Average power: {result.metrics.avg_power:.2e}")
-        print(f"Rise time: {result.metrics.t_rise_50:.2e}")
-        print(f"Delay: {result.metrics.delay_ps:.2e}")
-        print(f"PDP: {result.metrics.pdp:.2e}")
-    except Exception as e:
-        print(f"Optimization failed: {str(e)}")
-
-    optimizer = LTSpiceOptimizer(
-        net_file="~/.wine/drive_c/my_ltspice_files/StrongArmLatch.net",
-        ltspice_path="~/.wine/drive_c/Program Files/LTC/LTspiceXVII/XVIIx64.exe",
-        epsilon=5,
-        initial_learning_rate=0.02,
-        max_iterations=15,
-        weights={
-            "avg_power": 0.0e5,
-            "t_rise_50": 1.0e11,
-            "delay_ps": 1.0e11,
-            "pdp": 0.5e16,
-        },
-        regularization_weight=2,
-        csv_log_file="optimization_results_no_power.csv",
-    )
-
-    try:
-        result = optimizer.optimize_multi(n_starts=8)
-        print("\nOptimization complete! NO POWER PRECEDENCE")
         print(f"Best objective value: {result.objective:.2e}")
         print("Best parameters:", result.params)
         print("\nFinal metrics:")
